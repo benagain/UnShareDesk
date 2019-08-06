@@ -20,6 +20,7 @@ namespace CleanDesk
 {
     internal class Program
     {
+        private static IZendeskApi api;
         private static readonly AsyncPolicy policy = DefineAndRetrieveResiliencyStrategy();
         private static int dotCount = 0;
 
@@ -39,10 +40,16 @@ namespace CleanDesk
                    .AddJsonFile("appsettings.development.json", optional: true, reloadOnChange: true);
 
                 var configuration = builder.Build();
-                var mySettingsConfig = new Settings();
-                configuration.GetSection("MySettings").Bind(mySettingsConfig);
+                var settings = new Settings();
+                configuration.GetSection("Settings").Bind(settings);
 
-                await CleanDesk(mySettingsConfig);
+                api = new ZendeskApi("https://esfa.zendesk.com/", settings.UserName, settings.UserPassword);
+                httpClient = MakeHttpClient(settings);
+
+                //*
+                await CleanDesk(settings);
+                /**/
+                await ReportDesk(settings);
             }
             catch (Exception e)
             {
@@ -50,48 +57,84 @@ namespace CleanDesk
             }
         }
 
+        private static async Task ReportDesk(Settings settings)
+        {
+            int top = Console.CursorTop;
+
+            const int pauseSeconds = 240;
+            var pauseTicks = pauseSeconds * 10;
+            double width = Convert.ToDouble(Console.WindowWidth);
+            var wTick = width / pauseTicks;
+
+            for (; ; )
+            {
+                {
+                    var u = await InitialSearch<User>();
+                    Console.WriteLine($"Zendesk reports {u.Count} users");
+
+                    var o = await InitialSearch<Organization>();
+                    Console.WriteLine($"Zendesk reports {o.Count} organisations");
+
+                    if (u.Count == 0 && o.Count == 0) return;
+
+                    for (int i = 0; i <= pauseTicks; ++i)
+                    {
+                        Console.SetCursorPosition(0, top + 2);
+                        Console.WriteLine(new string('_', Convert.ToInt32(wTick * (pauseTicks - i))) + new string(' ', Console.WindowWidth));
+
+                        await Task.Delay(TimeSpan.FromMilliseconds(100));
+                    }
+
+                    Console.SetCursorPosition(0, 0);
+                    Console.WriteLine(new string(' ', Console.WindowWidth * 20));
+                    Console.SetCursorPosition(0, 0);
+
+                    await CleanDesk(settings);
+                }
+            }
+        }
+
         private static async Task CleanDesk(Settings settings)
         {
-            var api = new ZendeskApi("https://esfa.zendesk.com/", settings.UserName, settings.UserPassword);
-
             // Orgs
-            Console.Write("Searching for orgs ");
-            var orgs = (await SearchAll<Organization>(api))
+            Console.WriteLine("Searching for orgs ");
+            var orgs = (await SearchAll<Organization>())
                 .OrderBy(x => x.Name);
 
-            Console.Write("\nDeleting orgs ");
-            await Delete(orgs, api);
+            Console.WriteLine($"\nDeleting {orgs.Count()} orgs ");
+            await Delete(orgs);
 
             //var displayOrgs = orgs.Select(x => $"{x.Id:000000000000}: {x.Name}").ToList();
             //Console.WriteLine($"\n\nOrganisations:\n{string.Join("\n", displayOrgs)}");
 
             // Users
-            Console.Write("Searching for users ");
-            var users = (await SearchAll<User>(api))
+            Console.WriteLine("Searching for users ");
+            var users = (await SearchAll<User>())
                 .Where(x => x.Role == "end-user")
                 .OrderBy(x => x.Name);
 
-            Console.Write("\nDeleting users ");
-            await Delete(users, api);
+            Console.WriteLine($"\nDeleting {users.Count()} users ");
+            await Delete(users);
 
             //var displayUsers = users.Select(x => $"{x.Id:000000000000}: {x.Name}").ToList();
             //Console.WriteLine($"\n\nUsers:\n{string.Join("\n", displayUsers)}");
         }
 
-        private static async Task Delete(IOrderedEnumerable<User> users, IZendeskApi api)
+        private static async Task Delete(IOrderedEnumerable<User> users)
         {
             dotCount = 0;
             foreach (var o in users.Batch(500))
             {
                 var q = o.Select(x => x.Id).Join(",");
                 await policy.ExecuteAsync(() => api.Users.BulkDeleteUsersAsync(o));
+                await Task.Delay(TimeSpan.FromSeconds(15));
                 Dot();
             }
 
             Console.WriteLine($"Deleted {users.Count()} users");
         }
 
-        private static async Task Delete(IOrderedEnumerable<Organization> users, IZendeskApi api)
+        private static async Task Delete(IOrderedEnumerable<Organization> users)
         {
             dotCount = 0;
             foreach (var o in users.Batch(500))
@@ -104,12 +147,12 @@ namespace CleanDesk
             Console.WriteLine($"Deleted {users.Count()} organisations");
         }
 
-        private static readonly HttpClient httpClient = MakeHttpClient();
+        private static HttpClient httpClient;
 
-        private static HttpClient MakeHttpClient()
+        private static HttpClient MakeHttpClient(Settings settings)
         {
             var httpClient = new HttpClient();
-            var byteArray = Encoding.ASCII.GetBytes("ben.arnold@digital.education.gov.uk/token:b4SMhio3QwUbAGiSaLzE6k9Y8jAd5qHA3zowWjqh");
+            var byteArray = Encoding.ASCII.GetBytes($"{settings.UserName}:{settings.UserPassword}");
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(byteArray));
             return httpClient;
         }
@@ -146,13 +189,17 @@ namespace CleanDesk
             Console.Write(ch);
         }
 
-        private static async Task<IEnumerable<T>> SearchAll<T>(ZendeskApi api) where T : ISearchable
+        private static async Task<IEnumerable<T>> SearchAll<T>() where T : ISearchable
         {
-            var totalPages = (await api.Search.SearchForAsync<T>("created>2019-07-20")).TotalPages;
+            var initialResults = await InitialSearch<T>();
+            var totalPages = initialResults.TotalPages;
+
+            Console.WriteLine($"Retrieving details of {initialResults.Count} records");
 
             var tasks = new List<Task<PolicyResult<SearchResults<T>>>>();
 
-            for (var i = 0; i < totalPages; ++i)
+            dotCount = 0;
+            for (var i = 1; i <= totalPages; ++i)
             {
                 var task = policy.ExecuteAndCaptureAsync(() => api.Search.SearchForAsync<T>("created>2019-07-20", page: i));
 
@@ -161,6 +208,11 @@ namespace CleanDesk
 
             return (await Task.WhenAll(tasks))
                 .SelectMany(x => x.Result.Results);
+        }
+
+        private static async Task<SearchResults<T>> InitialSearch<T>() where T : ISearchable
+        {
+            return await api.Search.SearchForAsync<T>("created>2019-07-20");
         }
     }
 
