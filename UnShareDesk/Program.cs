@@ -57,14 +57,14 @@ namespace UnShareDesk
             var pb = new ProgressBar(PbStyle.DoubleLine, (int)control.Count);
             var errors = new Dictionary<User, string>();
 
-            int count = 1;
+            int updatedCount = 0;
             for (int i = 0; i < control.TotalPages; ++i)
             {
                 var users = (await policy.ExecuteAndCaptureAsync(() => api.Search.SearchForAsync<User>("created>2019-07-20", page: i))).Result;
 
                 foreach (var u in users.Results)
                 {
-                    pb.Refresh(count++, u.Name);
+                    pb.Next(u.Name);
 
                     if (u.SharedPhoneNumber == true)
                     {
@@ -72,6 +72,7 @@ namespace UnShareDesk
                         {
                             u.SharedPhoneNumber = false;
                             await policy.ExecuteAsync(() => api.Users.UpdateUserAsync(u));
+                            updatedCount++;
                         }
                         catch (Exception e)
                         {
@@ -81,10 +82,13 @@ namespace UnShareDesk
                 }
             }
 
+            pb.Refresh((int)control.Count, "");
+
+            Console.WriteLine($"Updated {updatedCount} users.");
             if (errors.Any())
             {
                 Console.WriteLine($"There were {errors.Count()} errors...");
-                var erlist = string.Join(Environment.NewLine, errors.Select(x => $"{x.Key}: {(x.Value)}"));
+                var erlist = string.Join(Environment.NewLine, errors.Select(x => $"{x.Key.Name}, {(x.Value)}"));
                 Console.WriteLine(erlist);
             }
         }
@@ -98,7 +102,9 @@ namespace UnShareDesk
                     var resp = new Regex("{.*}").Match(we.Message).Value;
                     var error = JObject.Parse(resp);
                     var description = error.SelectTokens("$..description").Last() as JValue;
-                    return description.Value.ToString();
+                    var a = new Regex("Phone number: (.*) is already being used by another user: <a href=\"/agent/users/(.*)\">(.*)</a>.")
+                        .Replace(description.Value.ToString(), "Duplicate phone number $1, {$2}, `$3`");
+                    return a;
                 }
             }
             catch { }
